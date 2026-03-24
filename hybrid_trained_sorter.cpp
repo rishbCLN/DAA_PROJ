@@ -22,10 +22,14 @@ using namespace std;
 
 static const int FEATURE_COUNT = 5;
 static const int ALGO_COUNT = 5;
+static const int KD_NEIGHBOR_COUNT = 5;
 static const int MIN_GENERATED_ARRAYS = 10100;
 static const int MIN_GENERATED_LENGTH = 7000;
 static const int MAX_GENERATED_LENGTH = 100000;
 static const long long MAX_GENERATED_VALUE = 1000000LL;
+static const int TRAIN_BENCH_REPEATS = 3;
+static const double VOTING_EPS = 1e-9;
+static const double CLOSE_SCORE_RATIO = 0.92;
 
 struct MemoryEntry {
     array<double, FEATURE_COUNT> features{};
@@ -271,6 +275,8 @@ static void writeLearningRow(const MemoryEntry &entry, bool appendMode) {
     ofstream file(LEARNING_FILE, mode);
     if (!file.is_open()) return;
 
+    file << setprecision(17);
+
     for (int i = 0; i < FEATURE_COUNT; ++i) {
         if (i) file << ',';
         file << entry.features[i];
@@ -283,6 +289,8 @@ static void writeNormalizationParams(const array<double, FEATURE_COUNT> &mean,
                                      const array<double, FEATURE_COUNT> &stdev) {
     ofstream file(NORMALIZATION_FILE, ios::out | ios::trunc);
     if (!file.is_open()) return;
+
+    file << setprecision(17);
 
     for (int i = 0; i < FEATURE_COUNT; ++i) {
         if (i) file << ',';
@@ -356,6 +364,7 @@ static vector<MemoryEntry> readFromFile() {
 }
 
 static void rebuildModel(const vector<MemoryEntry> &mem);
+static void sortByAlgorithm(vector<int> &arr, const string &algo);
 
 static bool loadTrainedModel(vector<MemoryEntry> &mem) {
     if (!readNormalizationParams(gFeatureMean, gFeatureStd)) {
@@ -547,6 +556,16 @@ static string trainOnArray(const vector<int> &baseArr, array<double, ALGO_COUNT>
     string bestAlgo = "NONE";
     double bestTime = numeric_limits<double>::infinity();
 
+    auto medianTime = [](vector<double> &samples) -> double {
+        if (samples.empty()) return numeric_limits<double>::infinity();
+        sort(samples.begin(), samples.end());
+        size_t mid = samples.size() / 2;
+        if (samples.size() % 2 == 0) {
+            return 0.5 * (samples[mid - 1] + samples[mid]);
+        }
+        return samples[mid];
+    };
+
     for (int i = 0; i < ALGO_COUNT; ++i) {
         vector<int> copy = baseArr;
         const string &algo = ALGO_NAMES[i];
@@ -554,20 +573,26 @@ static string trainOnArray(const vector<int> &baseArr, array<double, ALGO_COUNT>
         if (algo == "CountingSort" && !countingSortAllowed(copy)) continue;
         if (algo == "RadixSort" && !allNonNegative(copy)) continue;
 
-        auto start = high_resolution_clock::now();
-        if (algo == "InsertionSort") {
-            insertionSort(copy);
-        } else if (algo == "CountingSort") {
-            countingSort(copy);
-        } else if (algo == "RadixSort") {
-            radixSort(copy);
-        } else if (algo == "QuickSort") {
-            quickSort(copy, 0, (int)copy.size() - 1);
-        } else if (algo == "MergeSort") {
-            mergeSort(copy, 0, (int)copy.size() - 1);
+        vector<double> runs;
+        runs.reserve(TRAIN_BENCH_REPEATS);
+        for (int repeat = 0; repeat < TRAIN_BENCH_REPEATS; ++repeat) {
+            copy = baseArr;
+            auto start = high_resolution_clock::now();
+            if (algo == "InsertionSort") {
+                insertionSort(copy);
+            } else if (algo == "CountingSort") {
+                countingSort(copy);
+            } else if (algo == "RadixSort") {
+                radixSort(copy);
+            } else if (algo == "QuickSort") {
+                quickSort(copy, 0, (int)copy.size() - 1);
+            } else if (algo == "MergeSort") {
+                mergeSort(copy, 0, (int)copy.size() - 1);
+            }
+            auto end = high_resolution_clock::now();
+            runs.push_back(duration<double, milli>(end - start).count());
         }
-        auto end = high_resolution_clock::now();
-        double elapsed = duration<double, milli>(end - start).count();
+        double elapsed = medianTime(runs);
         times[i] = elapsed;
         if (elapsed < bestTime) {
             bestTime = elapsed;
@@ -701,24 +726,56 @@ static void kdSearch(const vector<KDNode> &nodes,
     }
 }
 
-static string predictWithKDTree(const array<double, FEATURE_COUNT> &features) {
+static bool isAlgoApplicable(const string &algo, const vector<int> &arr) {
+    if (algo == "CountingSort") return countingSortAllowed(arr);
+    if (algo == "RadixSort") return allNonNegative(arr);
+    return !arr.empty();
+}
+
+static double benchmarkSingleRun(const vector<int> &arr, const string &algo) {
+    if (arr.empty() || algo == "NONE") return numeric_limits<double>::infinity();
+    if (!isAlgoApplicable(algo, arr)) return numeric_limits<double>::infinity();
+
+    vector<int> copy = arr;
+    auto start = high_resolution_clock::now();
+    sortByAlgorithm(copy, algo);
+    auto end = high_resolution_clock::now();
+    return duration<double, milli>(end - start).count();
+}
+
+static string predictWithKDTree(const array<double, FEATURE_COUNT> &features,
+                                const vector<int> *sourceArray) {
     if (!gModelReady || gMemory.empty()) return "NONE";
 
     array<double, FEATURE_COUNT> target = normalizeFeatures(features, gFeatureMean, gFeatureStd);
     priority_queue<pair<double, int>> best;
-    int k = min(5, (int)gMemory.size());
+    int k = min(KD_NEIGHBOR_COUNT, (int)gMemory.size());
     kdSearch(gKDNodes, gKDRoot, gNormalizedPoints, target, k, best);
 
     unordered_map<string, double> score;
-    const double eps = 1e-9;
     while (!best.empty()) {
         pair<double, int> top = best.top();
         best.pop();
         int index = top.second;
         const string &algo = gMemory[index].algo;
         if (algo == "NONE") continue;
-        score[algo] += 1.0 / (top.first + eps);
+        score[algo] += 1.0 / (top.first + VOTING_EPS);
     }
+
+    if (sourceArray != nullptr) {
+        vector<string> toRemove;
+        toRemove.reserve(score.size());
+        for (const auto &entry : score) {
+            if (!isAlgoApplicable(entry.first, *sourceArray)) {
+                toRemove.push_back(entry.first);
+            }
+        }
+        for (const string &algo : toRemove) {
+            score.erase(algo);
+        }
+    }
+
+    if (score.empty()) return "NONE";
 
     string bestAlgo = "NONE";
     double bestScore = -1.0;
@@ -728,6 +785,29 @@ static string predictWithKDTree(const array<double, FEATURE_COUNT> &features) {
             bestAlgo = entry.first;
         }
     }
+
+    if (sourceArray != nullptr && score.size() >= 2) {
+        vector<pair<string, double>> ranked(score.begin(), score.end());
+        sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
+            return a.second > b.second;
+        });
+
+        const string &firstAlgo = ranked[0].first;
+        const string &secondAlgo = ranked[1].first;
+        double firstScore = ranked[0].second;
+        double secondScore = ranked[1].second;
+
+        if (firstScore > 0.0 && (secondScore / firstScore) >= CLOSE_SCORE_RATIO) {
+            double firstTime = benchmarkSingleRun(*sourceArray, firstAlgo);
+            double secondTime = benchmarkSingleRun(*sourceArray, secondAlgo);
+            if (secondTime < firstTime) {
+                bestAlgo = secondAlgo;
+            } else {
+                bestAlgo = firstAlgo;
+            }
+        }
+    }
+
     return bestAlgo;
 }
 
@@ -925,7 +1005,7 @@ int main() {
 
                 array<double, FEATURE_COUNT> features = extractFeatures(arr);
 
-                string algo = predictWithKDTree(features);
+                string algo = predictWithKDTree(features, &arr);
                 cout << "Array " << (i + 1) << " predicted algo: " << algo << '\n';
             }
         } else if (choice == 3) {
